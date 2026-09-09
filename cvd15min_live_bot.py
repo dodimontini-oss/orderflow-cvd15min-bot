@@ -8,6 +8,17 @@ early-half / 1.503 late-half walk-forward, 215 trades - the strongest
 result across everything tested in that research. BLOCK, ABSORPTION, and
 every other timeframe/confluence combination did NOT make this cut.
 
+EOD_PROFIT_ONLY FLATTEN RULE added 2026-09-08 (see
+cvd15min_eod_flatten_lab.py / project_orderflow_and_news_strategies
+memory): flattening a still-open position at each day's close IF it's
+currently profitable (never if it's a loser - a loser keeps riding toward
+its real stop/target exactly as before) is a REAL, walk-forward-validated
+improvement over pure buy-and-hold-the-bracket - PF 1.487 full-sample
+(vs. 1.430 baseline), 1.40 early / 1.54 late (beats baseline in BOTH
+halves). Unconditional daily flatten (regardless of P&L) was tested too
+and made things WORSE (PF 1.377) - the "only if profitable" condition is
+what makes this work, not the flattening itself. See docstring point 6.
+
 DEDICATED ALPACA PAPER ACCOUNT - its own, separate from every other bot
 (see orochi_modea_live_bot.py's docstring for why sharing an account
 between two QQQ-trading bots is a real hazard, not a theoretical one -
@@ -72,6 +83,15 @@ Rules (exactly matching the validated backtest, modulo the fix above):
    here (unlike ORB): a CVD crossover is a point-in-time event that
    can't recur on a later bar unless CVD genuinely crosses back, so
    "already in a position" alone prevents duplicate entries off one signal.
+6. EOD_PROFIT_ONLY flatten (validated 2026-09-08, see above): inside
+   EOD_FLATTEN_START-MARKET_CLOSE ET on ANY day (not just Friday, unlike
+   ORB's weekend-specific version), if still holding a position AND its
+   unrealized_pl is positive, cancel the resting bracket legs and close
+   at market instead of letting it ride further. A losing position is
+   NEVER touched by this - it keeps riding the normal bracket stop/target
+   exactly as before, across the session boundary if needed. The window
+   is 30 minutes wide (not just the literal last tick) for the same
+   missed/delayed-cron-run reason as orb_live_bot.py's Friday-flatten.
 
 Environment variables required:
     ALPACA_API_KEY
@@ -125,6 +145,7 @@ ET = ZoneInfo("America/New_York")
 UTC = ZoneInfo("UTC")
 MARKET_OPEN = dtime(9, 30)
 MARKET_CLOSE = dtime(16, 0)
+EOD_FLATTEN_START = dtime(15, 30)  # last 30 min of the session - see docstring point 6
 
 
 def market_is_open_now() -> bool:
@@ -299,6 +320,26 @@ def place_bracket_order(direction: str, qty: int, stop: float, target: float) ->
     return resp.json()
 
 
+def flatten_position(position: dict) -> dict:
+    """Cancel any resting bracket legs (a bare closing order can otherwise get rejected - Alpaca
+    reserves qty against open sell/buy-to-cover orders) then submit a plain market order to close the
+    position. Same helper as orb_live_bot.py's Friday-flatten, applied here on every day instead of
+    just Friday - see docstring point 6."""
+    for order in get_open_orders():
+        del_resp = requests.delete(f"{TRADING_BASE_URL}/v2/orders/{order['id']}", headers=HEADERS, timeout=10)
+        if del_resp.status_code >= 400:
+            log.error("Failed to cancel resting order %s (status %d): %s",
+                       order["id"], del_resp.status_code, del_resp.text)
+    qty = abs(float(position["qty"]))
+    side = "sell" if position["side"] == "long" else "buy"
+    body = {"symbol": SYMBOL, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}
+    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
+    if resp.status_code >= 400:
+        log.error("Alpaca rejected the EOD-flatten close order (status %d): %s", resp.status_code, resp.text)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def check_and_trade():
     if not market_is_open_now():
         log.info("Outside regular market hours (9:30-16:00 ET, weekdays). No action.")
@@ -306,6 +347,17 @@ def check_and_trade():
 
     position = get_position()
     if position is not None and float(position["qty"]) != 0:
+        now_et = datetime.now(ET)
+        unrealized_pl = float(position.get("unrealized_pl", 0))
+        if EOD_FLATTEN_START <= now_et.time() <= MARKET_CLOSE and unrealized_pl > 0:
+            log.info("EOD-flatten window, in a position (%s %s shares, unrealized P&L $%.2f > 0) - "
+                      "closing now to lock in profit instead of holding through the close (validated "
+                      "rule - EOD_PROFIT_ONLY beat baseline PF in both walk-forward halves, see "
+                      "cvd15min_eod_flatten_lab.py / docstring point 6).",
+                      position["side"], position["qty"], unrealized_pl)
+            result = flatten_position(position)
+            log.info("Alpaca response: %s", result)
+            return
         log.info("Already in a position (%s %s shares). Bracket order manages the exit. No action.",
                   position["side"], position["qty"])
         return
