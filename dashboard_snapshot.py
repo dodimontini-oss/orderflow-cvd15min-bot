@@ -15,6 +15,12 @@ Environment variables required:
     ALPACA_SECRET_KEY
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0,str(_Path(__file__).resolve().parents[1]))
+from trading_core.history import alpaca_orders
+from trading_core.ledger import closed_trades as reconcile_trades
+
 import json
 import os
 from datetime import datetime, timezone
@@ -45,11 +51,8 @@ def get_positions() -> list:
     return resp.json()
 
 
-def get_all_orders() -> list:
-    params = {"status": "all", "limit": 500, "direction": "desc", "nested": "true"}
-    resp = requests.get(f"{ALPACA_BASE_URL}/v2/orders", headers=HEADERS, params=params, timeout=15)
-    resp.raise_for_status()
-    return sorted(resp.json(), key=lambda o: o.get("submitted_at") or o.get("created_at") or "")
+def get_all_orders():
+    return alpaca_orders(ALPACA_BASE_URL, HEADERS)
 
 
 def find_filled_leg(order: dict):
@@ -78,26 +81,7 @@ def run():
         "unrealized_pl_pct": float(p["unrealized_plpc"]) * 100,
     } for p in positions]
 
-    closed_trades = []
-    for o in entries:
-        side = o["side"]
-        status = o["status"]
-        qty = o.get("filled_qty") or o.get("qty")
-        entry_price = float(o["filled_avg_price"]) if o.get("filled_avg_price") else None
-        if status != "filled" or entry_price is None:
-            continue
-        kind, leg = find_filled_leg(o)
-        if kind is None:
-            continue
-        exit_price = float(leg["filled_avg_price"])
-        direction = 1 if side == "buy" else -1
-        pnl = (exit_price - entry_price) * float(qty) * direction
-        closed_trades.append({
-            "closed_at": leg.get("filled_at"),
-            "pnl": pnl,
-            "symbol": o["symbol"],
-        })
-    closed_trades.sort(key=lambda t: t["closed_at"] or "")
+    closed_trades = reconcile_trades(orders)
 
     total_unrealized = sum(p["unrealized_pl"] for p in open_positions)
     realized_pl_alltime = sum(t["pnl"] for t in closed_trades)
@@ -112,6 +96,7 @@ def run():
         "balance": equity - total_unrealized,
         "unrealized_pl": total_unrealized,
         "realized_pl_alltime": realized_pl_alltime,
+        "realized_pl_basis": "Gross execution P&L; separate broker fees excluded",
         "open_positions": open_positions,
         "closed_trades": closed_trades,
     }

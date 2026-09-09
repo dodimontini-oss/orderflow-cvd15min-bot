@@ -98,6 +98,11 @@ Environment variables required:
     ALPACA_SECRET_KEY
 """
 
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+from trading_core import execution as safety
+
 import logging
 import os
 from datetime import datetime, time as dtime, timedelta
@@ -149,10 +154,13 @@ EOD_FLATTEN_START = dtime(15, 30)  # last 30 min of the session - see docstring 
 
 
 def market_is_open_now() -> bool:
-    now_et = datetime.now(ET)
-    if now_et.weekday() >= 5:  # Saturday/Sunday
+    global SESSION_CLOSE
+    broker=safety.Alpaca(TRADING_BASE_URL,HEADERS)
+    session=broker.session()
+    if session is None:
         return False
-    return MARKET_OPEN <= now_et.time() <= MARKET_CLOSE
+    opening,SESSION_CLOSE=session
+    return opening <= pd.Timestamp.now(tz="America/New_York") < SESSION_CLOSE
 
 
 def fetch_recent_trades(days_back: int) -> pd.DataFrame:
@@ -209,7 +217,7 @@ def prep_rth(trades_classified: pd.DataFrame) -> pd.DataFrame:
     df = trades_classified.copy()
     et = df["t"].dt.tz_convert(ET)
     df["hm"] = et.dt.strftime("%H:%M")
-    return df[(df["hm"] >= "09:30") & (df["hm"] <= "16:00")].reset_index(drop=True)
+    return df[(df["hm"] >= "09:30") & (df["hm"] < "16:00")].reset_index(drop=True)
 
 
 def build_15min_bars(df_rth: pd.DataFrame) -> pd.DataFrame:
@@ -301,43 +309,17 @@ def get_account_info() -> dict:
     return resp.json()
 
 
-def place_bracket_order(direction: str, qty: int, stop: float, target: float) -> dict:
-    side = "buy" if direction == "LONG" else "sell"
-    body = {
-        "symbol": SYMBOL,
-        "qty": str(qty),
-        "side": side,
-        "type": "market",
-        "time_in_force": "gtc",  # keeps the stop/target legs live even if the position carries past today's close
-        "order_class": "bracket",
-        "take_profit": {"limit_price": str(round(target, 2))},
-        "stop_loss": {"stop_price": str(round(stop, 2))},
-    }
-    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
-    if resp.status_code >= 400:
-        log.error("Alpaca rejected the order (status %d): %s", resp.status_code, resp.text)
-    resp.raise_for_status()
-    return resp.json()
+def place_bracket_order(direction: str, qty: int, stop: float, target: float, client_id=None) -> dict:
+    if client_id is None:
+        raise ValueError("Missing signal identity")
+    return safety.Alpaca(TRADING_BASE_URL,HEADERS).submit({"symbol":SYMBOL,"qty":str(qty),
+        "side":"buy" if direction=="LONG" else "sell","type":"market","time_in_force":"gtc",
+        "order_class":"bracket","take_profit":{"limit_price":str(round(target,2))},
+        "stop_loss":{"stop_price":str(round(stop,2))},"client_order_id":client_id})
 
 
 def flatten_position(position: dict) -> dict:
-    """Cancel any resting bracket legs (a bare closing order can otherwise get rejected - Alpaca
-    reserves qty against open sell/buy-to-cover orders) then submit a plain market order to close the
-    position. Same helper as orb_live_bot.py's Friday-flatten, applied here on every day instead of
-    just Friday - see docstring point 6."""
-    for order in get_open_orders():
-        del_resp = requests.delete(f"{TRADING_BASE_URL}/v2/orders/{order['id']}", headers=HEADERS, timeout=10)
-        if del_resp.status_code >= 400:
-            log.error("Failed to cancel resting order %s (status %d): %s",
-                       order["id"], del_resp.status_code, del_resp.text)
-    qty = abs(float(position["qty"]))
-    side = "sell" if position["side"] == "long" else "buy"
-    body = {"symbol": SYMBOL, "qty": str(qty), "side": side, "type": "market", "time_in_force": "day"}
-    resp = requests.post(f"{TRADING_BASE_URL}/v2/orders", headers=HEADERS, json=body, timeout=15)
-    if resp.status_code >= 400:
-        log.error("Alpaca rejected the EOD-flatten close order (status %d): %s", resp.status_code, resp.text)
-    resp.raise_for_status()
-    return resp.json()
+    return safety.Alpaca(TRADING_BASE_URL,HEADERS).close(SYMBOL)
 
 
 def check_and_trade():
@@ -349,7 +331,7 @@ def check_and_trade():
     if position is not None and float(position["qty"]) != 0:
         now_et = datetime.now(ET)
         unrealized_pl = float(position.get("unrealized_pl", 0))
-        if EOD_FLATTEN_START <= now_et.time() <= MARKET_CLOSE and unrealized_pl > 0:
+        if pd.Timestamp(now_et) >= SESSION_CLOSE-pd.Timedelta(minutes=30) and unrealized_pl > 0:
             log.info("EOD-flatten window, in a position (%s %s shares, unrealized P&L $%.2f > 0) - "
                       "closing now to lock in profit instead of holding through the close (validated "
                       "rule - EOD_PROFIT_ONLY beat baseline PF in both walk-forward halves, see "
@@ -390,13 +372,20 @@ def check_and_trade():
     bars = add_atr(bars)
     bars = add_cvd_signal(bars)
 
-    recent = bars.tail(LOOKBACK_BARS)
+    today = pd.Timestamp.now(tz="America/New_York").date()
+    bars_today = bars[bars["t"].dt.tz_convert(ET).dt.date == today]
+    recent = bars_today.tail(1)  # one completed-bar event, no three-bar replay
+    if pd.Timestamp.now(tz="America/New_York") >= SESSION_CLOSE-pd.Timedelta(minutes=30):
+        return
     signal_rows = recent[recent["signal"].notna()]
     if signal_rows.empty:
         log.info("No CVD crossover in the last %d completed bars. No action.", LOOKBACK_BARS)
         return
     latest_signal_row = signal_rows.iloc[-1]
     direction = latest_signal_row["signal"]
+    client_id = safety.signal_id("cvd15",SYMBOL,latest_signal_row["t"])
+    if safety.Alpaca(TRADING_BASE_URL,HEADERS).by_client(client_id) is not None:
+        return
 
     daily_trend = fetch_daily_trend()
     if daily_trend is None:
@@ -453,7 +442,7 @@ def check_and_trade():
 
     log.info("%s CVD crossover confirmed (signal bar close=%.2f, HTF trend=%s) - placing bracket: qty=%d "
               "stop=%.2f target=%.2f", direction, latest_signal_row["close"], daily_trend, qty, stop, target)
-    result = place_bracket_order(direction, qty, stop, target)
+    result = place_bracket_order(direction, qty, stop, target, client_id)
     log.info("Alpaca response: %s", result)
 
 
