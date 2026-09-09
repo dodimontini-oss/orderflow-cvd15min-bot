@@ -447,4 +447,8 @@ def check_and_trade():
 
 
 if __name__ == "__main__":
-    check_and_trade()
+    if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+        from trading_core.smoke import alpaca_cancel_test
+        alpaca_cancel_test(TRADING_BASE_URL, HEADERS, "SPY")
+    else:
+        check_and_trade()
