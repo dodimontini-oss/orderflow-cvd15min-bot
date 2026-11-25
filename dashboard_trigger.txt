@@ -1,2 +1,2 @@
 Marker file for the Dashboard Snapshot workflow's push trigger. Committing a change to this file fires the dashboard_snapshot.yml Action. Safe to ignore otherwise.
-last_triggered_utc: 2026-11-24T15:13:43Z
+last_triggered_utc: 2026-11-25T15:11:44Z
